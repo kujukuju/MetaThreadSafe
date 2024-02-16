@@ -21,9 +21,9 @@ This metaprogram will automatically typcheck any modules that use any thread saf
 
 `@thread_isolated` can only call into `@thread_isolated`, or `@thread_safe`.
 
-`@thread` is another alias for `@thread_isolated`.
+`@thread_isolated` can call into unmarked functions when that functions corresponding mutex has been locked.
 
-`@thread` can call into unmarked functions when that functions corresponding mutex has been locked.
+`@thread` is another alias for `@thread_isolated`.
 
 #### @thread_safe
 
