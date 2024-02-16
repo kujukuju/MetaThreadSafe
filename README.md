@@ -1,7 +1,7 @@
 
 ### Thread Safety Notes
 
-This metaprogram will automatically typcheck any modules that use any thread safety marking notes.
+This metaprogram will automatically safety check any modules that use any thread safety marking notes.
 
 ### Safety Checking Rules
 
@@ -11,11 +11,11 @@ This metaprogram will automatically typcheck any modules that use any thread saf
 
 `@thread_unlocked` should also be your entry point for the thread function. This is where the safety check starts.
 
-`@thread_unlocked` allows you to call into unmarked functions as long as you've locked a mutex. For each unique unmarked procedure call, it must be locked using a single mutex.
+`@thread_unlocked` allows you to call into unmarked functions as long as you've locked a mutex. Every call into a given unsafe function must acquire the same mutex lock for a given thread name.
 
 `@thread_unlocked(name)` can be used when you have multiple threads that start and end in sync with each other.
 
-`@thread_unlocked(name)` allows you to use a unique mutex per given name when calling into unique unmarked procedures.
+`@thread_unlocked(name)` allows you to have a unique set of allowed mutex locks for a given unsafe callback.
 
 #### @thread_isolated @thread
 

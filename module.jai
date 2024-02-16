@@ -126,6 +126,12 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
                 if !validate_unlocked(plugin, subexpressions, visited, mutex_options, *locked_mutexes, header.name) {
                     return;
                 }
+
+                if locked_mutexes.count > 0 {
+                    for locked_mutex: locked_mutexes {
+                        compiler_report(plugin, "Finished checking the whole unlocked thread stack, but found remaining locked mutexes. This implies either there's complicated mutex lock/unlock logic that calls back into previous stack methods and we can't handle this, or a single method that locks/unlocks a mutex has already been visited and won't be visited again with how the recursive logic is currently set up, and this is potentially fixable.", locked_mutex.location, .ERROR_CONTINUABLE);
+                    }
+                }
             }
 
             if plugin.failed {
@@ -160,6 +166,7 @@ ThreadSafetyPlugin :: struct {
     marked_unique_headers: [..] *Code_Procedure_Header;
     vague_headers: Table(string, bool);
     mutex_options: Table(string, Table(*Code_Procedure_Header, [..] *Code_Node));
+    deferred_subexpressions: [..] *Code_Node;
     failed: bool;
 }
 
@@ -167,20 +174,24 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
     #if DEBUG then print(precursor);
     #if DEBUG then print("Validating: %\n", identifier);
 
+    if plugin.deferred_subexpressions.allocated < subexpressions.count {
+        array_reserve(*plugin.deferred_subexpressions, subexpressions.count);
+    }
+    plugin.deferred_subexpressions.count = subexpressions.count;
+
     normal_index := 0;
     defer_index := subexpressions.count - 1;
-    deferred_subexpressions := NewArray(subexpressions.count, *Code_Node);
     for subexpression: subexpressions {
         if subexpression.kind == .DEFER {
-            deferred_subexpressions[defer_index] = subexpression;
+            plugin.deferred_subexpressions[defer_index] = subexpression;
             defer_index -= 1;
         } else {
-            deferred_subexpressions[normal_index] = subexpression;
+            plugin.deferred_subexpressions[normal_index] = subexpression;
             normal_index += 1;
         }
     }
 
-    for subexpression: deferred_subexpressions {
+    for subexpression: plugin.deferred_subexpressions {
         if table_contains(visited, subexpression) {
             continue;
         }
