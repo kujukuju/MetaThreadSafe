@@ -17,9 +17,11 @@ This metaprogram will automatically typcheck any modules that use any thread saf
 
 `@thread_unlocked(name)` allows you to use a unique mutex per given name when calling into unique unmarked procedures.
 
-#### @thread_isolated
+#### @thread_isolated @thread
 
 `@thread_isolated` can only call into `@thread_isolated`, or `@thread_safe`.
+
+`@thread` is another alias for `@thread_isolated`.
 
 #### @thread_safe
 
