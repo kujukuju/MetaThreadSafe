@@ -10,8 +10,6 @@ get_plugin :: () -> *Metaprogram_Plugin {
 
 #scope_module
 
-DEBUG :: false;
-
 before_intercept :: (plugin: *Metaprogram_Plugin, flags: *Intercept_Flags) {
     // it seems like flags should be adding checks, not removing them?
     // reducing complexity like this could conflict with other plugins
@@ -30,10 +28,9 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
                 found_unlocked := false;
                 found_saftey_check := false;
                 for note: header.notes {
-                    found_unlocked = found_unlocked || equal_nocase(note.text, "thread_unlocked");
+                    found_unlocked = found_unlocked || begins_with_nocase(note.text, "thread_unlocked");
                     found_saftey_check = found_saftey_check || found_unlocked;
                     found_saftey_check = found_saftey_check || equal_nocase(note.text, "thread_isolated");
-                    found_saftey_check = found_saftey_check || equal_nocase(note.text, "thread_locked");
                     found_saftey_check = found_saftey_check || equal_nocase(note.text, "thread_safe");
                 }
 
@@ -90,34 +87,62 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
                 print("No thread safety modules found.\n");
             }
 
+            locked_mutexes: [..] *Code_Node;
+            locked_mutexes.allocator = temp;
+
             for header: plugin.unlocked {
                 if !header.body_or_null {
                     compiler_report(plugin, "Thread safety marked header did not have a body.", header.location);
                     return;
                 }
 
-                table_set(*plugin.visited, header.body_or_null, true);
+                unlocked_string: string;
+                for note: header.notes {
+                    if begins_with_nocase(note.text, "thread_unlocked") {
+                        unlocked_string = note.text;
+                    }
+                }
+
+                no_name_count :: "thread_unlocked".count;
+
+                unlocked_name: string;
+                if unlocked_string.count >= no_name_count + 2 && unlocked_string[no_name_count] == #char "(" && unlocked_string[unlocked_string.count - 1] == #char ")" {
+                    unlocked_name.data = unlocked_string.data + no_name_count + 1;
+                    unlocked_name.count = unlocked_string.count - no_name_count - 2;
+                }
+
+                visited := find_or_add(*plugin.visited, unlocked_name);
+                mutex_options := find_or_add(*plugin.mutex_options, unlocked_name);
+                locked_mutexes.count = 0;
+
+                table_set(visited, header.body_or_null, true);
 
                 subexpressions := get_subexpressions(header.body_or_null);
-                if !validate_unlocked(plugin, subexpressions, header.name, "") {
+                if !validate_unlocked(plugin, subexpressions, visited, mutex_options, *locked_mutexes, header.name) {
                     return;
                 }
             }
+
+            // if plugin.failed {
+            //     compiler_set_workspace_status(.FAILED, plugin.workspace);
+            // }
     }
 }
 
 shutdown :: (plugin: *Metaprogram_Plugin) {
     using thread_safety_plugin := cast(*ThreadSafetyPlugin) plugin;
 
-    array_free(relevant_modules);
-    array_free(unlocked);
-    deinit(*visited);
-    array_free(marked_unique_headers);
-    deinit(*vague_headers);
-    free(plugin);
+    // array_free(relevant_modules);
+    // array_free(unlocked);
+    // deinit(*visited);
+    // array_free(marked_unique_headers);
+    // deinit(*vague_headers);
+    // free(plugin);
 }
 
 #scope_file
+
+DEBUG :: false;
 
 ThreadSafetyPlugin :: struct {
     #as using base: Metaprogram_Plugin;
@@ -125,23 +150,37 @@ ThreadSafetyPlugin :: struct {
     relevant_modules: [..] Message_Import;
     unlocked: [..] *Code_Procedure_Header;
     // TODO should just actually use stack path for this so it's also easy to check dead lock
-    visited: Table(*Code_Node, bool);
+    visited: Table(string, Table(*Code_Node, bool));
     // TODO this is a temporary measure until I figure out how to continue traversal past a for_expansion
     marked_unique_headers: [..] *Code_Procedure_Header;
     vague_headers: Table(string, bool);
-    errored: bool;
+    mutex_options: Table(string, Table(*Code_Procedure_Header, [..] *Code_Node));
+    failed: bool;
 }
 
-validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node, identifier: string = "", precursor: string = "") -> bool {
+validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node, visited: *Table(*Code_Node, bool), mutex_options: *Table(*Code_Procedure_Header, [..] *Code_Node), locked_mutexes: *[..] *Code_Node, identifier: string = "", precursor: string = "") -> bool {
     #if DEBUG then print(precursor);
     #if DEBUG then print("Validating: %\n", identifier);
 
+    normal_index := 0;
+    defer_index := subexpressions.count - 1;
+    deferred_subexpressions := NewArray(subexpressions.count, *Code_Node);
     for subexpression: subexpressions {
-        if table_contains(*plugin.visited, subexpression) {
+        if subexpression.kind == .DEFER {
+            deferred_subexpressions[defer_index] = subexpression;
+            defer_index -= 1;
+        } else {
+            deferred_subexpressions[normal_index] = subexpression;
+            normal_index += 1;
+        }
+    }
+
+    for subexpression: deferred_subexpressions {
+        if table_contains(visited, subexpression) {
             continue;
         }
 
-        table_set(*plugin.visited, subexpression, true);
+        table_set(visited, subexpression, true);
 
         #if DEBUG then print(precursor);
         #if DEBUG then print("\tKind: %\n", subexpression.kind);
@@ -213,13 +252,10 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
                 resolved_header := cast(*Code_Procedure_Header) resolved_call_expression;
 
                 found_isolated := false;
-                found_locked := false;
                 found_safe := false;
                 for note: resolved_header.notes {
                     if equal_nocase(note.text, "thread_isolated") {
                         found_isolated = true;
-                    } else if equal_nocase(note.text, "thread_locked") {
-                        found_locked = true;
                     } else if equal_nocase(note.text, "thread_safe") {
                         found_safe = true;
                     }
@@ -227,7 +263,7 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
 
                 if found_isolated {
                     subexpressions_header := get_subexpressions(resolved_header);
-                    if !validate_unlocked(plugin, subexpressions_header, resolved_header.name, tprint("%\t", precursor)) {
+                    if !validate_unlocked(plugin, subexpressions_header, visited, mutex_options, locked_mutexes, resolved_header.name, tprint("%\t", precursor)) {
                         return false;
                     }
 
@@ -237,22 +273,63 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
                     }
 
                     subexpressions_body := get_subexpressions(resolved_header.body_or_null);
-                    if !validate_unlocked(plugin, subexpressions_body, resolved_header.name, tprint("%\t", precursor)) {
-                        return false;
-                    }
-                } else if found_locked {
-                    #if DEBUG then print(precursor);
-                    #if DEBUG then print("\tLock check: %\n\n", resolved_header.name);
-                    if !validate_locked(plugin, resolved_header) {
+                    if !validate_unlocked(plugin, subexpressions_body, visited, mutex_options, locked_mutexes, resolved_header.name, tprint("%\t", precursor)) {
                         return false;
                     }
                 } else if found_safe {
                     #if DEBUG then print(precursor);
                     #if DEBUG then print("\tThread safe: %\n\n", resolved_header.name);
                 } else if is_relevant_module(plugin, resolved_header.location) {
-                    // if it wasn't marked isolated or locked but it's in a relevant module we reject this
-                    compiler_report(plugin, "Calling a non-thread safe function from a thread safe function in a thread safety checked module:", subexpression.location, .ERROR_CONTINUABLE);
+                    if locked_mutexes.count == 0 {
+                        compiler_report(plugin, "Calling a non-thread safe function from a thread safe function in a thread safety checked module. Without a locked mutex.", subexpression.location, .ERROR_CONTINUABLE);
+                        continue;
+                    }
+
+                    options := find_or_add(mutex_options, resolved_header);
+                    if options.count == 0 {
+                        // if there aren't yet any required mutexes, then add all of our locked mutexes
+                        array_add(options, ..(locked_mutexes.*));
+                    } else {
+                        i := 0;
+                        while i < options.count {
+                            // if the optional mutex isn't currently locked, we remove it from the requirement list as it's no longer a valid lock holder
+                            if !array_find(locked_mutexes.*, options.*[i]) {
+                                array_ordered_remove_by_index(options, i);
+                            } else {
+                                i += 1;
+                            }
+                        }
+
+                        // if there are no more optional mutexes left after locked mutex intersection, then it's no longer a valid call
+                        if options.count == 0 {
+                            compiler_report(plugin, "Calling a non-thread safe function and all mutexes that were expected to be locked, as indicated by other calls to this same function, weren't.", subexpression.location, .ERROR_CONTINUABLE);
+                            continue;
+                        }
+                    }
+
+                    #if DEBUG then print(precursor);
+                    #if DEBUG then print("\tHeader % was save due to mutex locks: % %\n", resolved_header.name, locked_mutexes.*);
                 } else {
+                    locked_mutex := get_maybe_locked_mutex(plugin, resolved_header, subexpression_call);
+                    if locked_mutex {
+                        if array_find(locked_mutexes.*, locked_mutex) {
+                            compiler_report(plugin, "Locking the same mutex twice before unlocking. If this is wrong and you have special mutex logic, then don't give your thread_unlocked a name.", subexpression.location, .ERROR_CONTINUABLE);
+                            continue;
+                        }
+                        
+                        array_add(locked_mutexes, locked_mutex);
+                    } else {
+                        unlocked_mutex := get_maybe_unlocked_mutex(plugin, resolved_header, subexpression_call);
+                        if unlocked_mutex {
+                            if !array_find(locked_mutexes.*, unlocked_mutex) {
+                                compiler_report(plugin, "Unlocking a mutex that's not locked. If this is wrong and you have special mutex logic, then don't give your thread_unlocked a name.", subexpression.location, .ERROR_CONTINUABLE);
+                                continue;
+                            }
+
+                            array_ordered_remove_by_value(locked_mutexes, unlocked_mutex);
+                        }
+                    }
+
                     #if DEBUG then print("\n");
                     #if DEBUG then print(precursor);
                     #if DEBUG then print("\tSkipping due to module: %\n\n", resolved_header.name);
@@ -260,72 +337,12 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
             }
         } else {
             child_subexpressions := get_subexpressions(subexpression);
-            if !validate_unlocked(plugin, child_subexpressions, tprint("%.", identifier), tprint("%\t", precursor)) {
+            if !validate_unlocked(plugin, child_subexpressions, visited, mutex_options, locked_mutexes, tprint("%.", identifier), tprint("%\t", precursor)) {
                 return false;
             }
         }
     }
 
-    return true;
-}
-
-// I think this maybe end up needing to be different in the future? idk
-// validate_isolated :: validate_unlocked;
-
-validate_locked :: (plugin: *ThreadSafetyPlugin, header: *Code_Procedure_Header) -> bool {
-    // TODO check for weak deadlocks, maybe based on a setting
-    found_lock := false;
-
-    if !header.body_or_null {
-        compiler_report(plugin, "Thread safety marked header did not have a body.", header.location);
-        return false;
-    }
-    subexpressions := get_subexpressions(header.body_or_null);
-
-    for subexpression: subexpressions {
-        if subexpression.kind != .PROCEDURE_CALL {
-            continue;
-        }
-
-        subexpression_call := cast(*Code_Procedure_Call) subexpression;
-        call_expression := subexpression_call.procedure_expression;
-        resolved_call_expression := subexpression_call.resolved_procedure_expression;
-
-        if !resolved_call_expression {
-            if call_expression && call_expression.kind == .IDENT {
-                call_ident := cast(*Code_Ident) call_expression;
-                resolved_call_expression = find_marked_unique_header(plugin, call_ident.name);
-            }
-
-            if !resolved_call_expression {
-                compiler_report(plugin, "Thread safety marked functions cannot make non-compile time function calls, as they cannot be safety checked. Alternatively there seems to be a bug with for_expansions where the body contents can't be recursed.\n\nNOTE: If you have a safety marked function with a unique name, it will work as a temporary workaround.", subexpression.location, .ERROR_CONTINUABLE);
-                continue;
-            }
-        }
-
-        if resolved_call_expression.kind != .PROCEDURE_HEADER {
-            compiler_report(plugin, tprint("Got a subexpression call that's not a procedure? %\n", subexpression_call.*), subexpression.location);
-            return false;
-        }
-
-        resolved_header := cast(*Code_Procedure_Header) resolved_call_expression;
-
-        if resolved_header.name == "lock" || resolved_header.name == "wait_for" {
-            enclosing_load := resolved_header.base.location.enclosing_load;
-            if enclosing_load && enclosing_load.enclosing_import {
-                module_name := enclosing_load.enclosing_import.module_name;
-                if module_name == "Thread" {
-                    found_lock = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    if !found_lock {
-        compiler_report(plugin, "Thread saftey function marked thread_locked did not lock a mutex or wait_for a semaphore.", header.location, .ERROR_CONTINUABLE);
-    }
-    
     return true;
 }
 
@@ -363,8 +380,8 @@ compiler_report :: (plugin: *ThreadSafetyPlugin, error_text: string, location: C
 
     compiler_report(error_text, loc, mode);
 
-    if mode == .ERROR || mode == .ERROR_CONTINUABLE {
-        compiler_set_workspace_status(.FAILED, plugin.workspace);
+    if !plugin.failed && (mode == .ERROR || mode == .ERROR_CONTINUABLE) {
+        plugin.failed = true;
     }
 }
 
@@ -387,6 +404,80 @@ find_marked_unique_header :: (plugin: *ThreadSafetyPlugin, name: string) -> *Cod
     }
 
     return null, -1;
+}
+
+get_maybe_locked_mutex :: (plugin: *ThreadSafetyPlugin, header: *Code_Procedure_Header, call: *Code_Procedure_Call) -> *Code_Node {
+    valid_header := false;
+
+    if header.name == "lock" {
+        enclosing_load := header.base.location.enclosing_load;
+        if enclosing_load && enclosing_load.enclosing_import {
+            module_name := enclosing_load.enclosing_import.module_name;
+            if module_name == "Thread" {
+                valid_header = true;
+            }
+        }
+    }
+
+    if !valid_header {
+        return null;
+    }
+
+    arguments := call.arguments_unsorted;
+    if arguments.count != 1 {
+        compiler_report(plugin, "Found a mutex unlock with more than 1 argument.", call.location);
+        return null;
+    }
+
+    argument := arguments[0];
+    if argument.expression && argument.expression.kind == .UNARY_OPERATOR {
+        unary := cast(*Code_Unary_Operator) argument.expression;
+        if unary.subexpression && unary.subexpression.kind == .IDENT {
+            ident := cast(*Code_Ident) unary.subexpression;
+
+            return ident.resolved_declaration;
+        }
+
+        return unary;
+    }
+
+    return null;
+}
+
+get_maybe_unlocked_mutex :: (plugin: *ThreadSafetyPlugin, header: *Code_Procedure_Header, call: *Code_Procedure_Call) -> *Code_Node {
+    valid_header := false;
+
+    if header.name == "unlock" {
+        enclosing_load := header.base.location.enclosing_load;
+        if enclosing_load && enclosing_load.enclosing_import {
+            module_name := enclosing_load.enclosing_import.module_name;
+            if module_name == "Thread" {
+                valid_header = true;
+            }
+        }
+    }
+
+    if !valid_header {
+        return null;
+    }
+
+    arguments := call.arguments_unsorted;
+    if arguments.count != 1 {
+        compiler_report(plugin, "Found a mutex unlock with more than 1 argument.", call.location);
+        return null;
+    }
+
+    argument := arguments[0];
+    if argument.expression && argument.expression.kind == .UNARY_OPERATOR {
+        unary := cast(*Code_Unary_Operator) argument.expression;
+        if unary.subexpression && unary.subexpression.kind == .IDENT {
+            ident := cast(*Code_Ident) unary.subexpression;
+
+            return ident.resolved_declaration;
+        }
+    }
+
+    return null;
 }
 
 #import "Basic";
