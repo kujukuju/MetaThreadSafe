@@ -31,6 +31,7 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
                     found_unlocked = found_unlocked || begins_with_nocase(note.text, "thread_unlocked");
                     found_saftey_check = found_saftey_check || found_unlocked;
                     found_saftey_check = found_saftey_check || equal_nocase(note.text, "thread_isolated");
+                    found_saftey_check = found_saftey_check || equal_nocase(note.text, "thread");
                     found_saftey_check = found_saftey_check || equal_nocase(note.text, "thread_safe");
                 }
 
@@ -111,6 +112,10 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
                     unlocked_name.count = unlocked_string.count - no_name_count - 2;
                 }
 
+                unlocked_name = to_lower_copy_new(unlocked_name,, allocator = temp);
+
+                // TODO this could technically fail in some scenarios where you're entering the same function through 2 different routes within the same name
+                // in that case, it would only traverse the given function once, while the mutex locks could be different in both scenarios
                 visited := find_or_add(*plugin.visited, unlocked_name);
                 mutex_options := find_or_add(*plugin.mutex_options, unlocked_name);
                 locked_mutexes.count = 0;
@@ -123,9 +128,9 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
                 }
             }
 
-            // if plugin.failed {
-            //     compiler_set_workspace_status(.FAILED, plugin.workspace);
-            // }
+            if plugin.failed {
+                compiler_set_workspace_status(.FAILED, plugin.workspace);
+            }
     }
 }
 
@@ -254,7 +259,7 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
                 found_isolated := false;
                 found_safe := false;
                 for note: resolved_header.notes {
-                    if equal_nocase(note.text, "thread_isolated") {
+                    if equal_nocase(note.text, "thread_isolated") || equal_nocase(note.text, "thread") {
                         found_isolated = true;
                     } else if equal_nocase(note.text, "thread_safe") {
                         found_safe = true;
