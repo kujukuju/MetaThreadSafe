@@ -1,10 +1,11 @@
-#run {
+#run,stallable {
     set_build_options_dc(.{do_output = false});
 
     w := compiler_create_workspace();
     options := get_build_options();
     options.output_type = .EXECUTABLE;
     options.output_executable_name = "example";
+    options.debug_for_expansions = true;
 
     set_build_options(options, w);
 
@@ -16,7 +17,7 @@
 
     compiler_begin_intercept(w, intercept_flags);
 
-    add_build_file("example.jai", w);
+    add_build_file("for_expansion_example.jai", w);
 
     while true {
         message := compiler_wait_for_message();

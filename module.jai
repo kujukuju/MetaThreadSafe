@@ -10,6 +10,8 @@ get_plugin :: () -> *Metaprogram_Plugin {
 
 #scope_module
 
+DEBUG :: false;
+
 before_intercept :: (plugin: *Metaprogram_Plugin, flags: *Intercept_Flags) {
     // it seems like flags should be adding checks, not removing them?
     // reducing complexity like this could conflict with other plugins
@@ -41,73 +43,29 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
                         add_relevant_module(plugin, enclosing_load.enclosing_import);
                     }
 
-                    // if header.polymorph_source_header {
-                    //     print("FOOUND POLYMORPH SOURCE: % %\n", header.name, header.polymorph_source_header.*);
-                    // }
+                    // if we found a header that's already unique, now it's vague
+                    unique_header, unique_index := find_marked_unique_header(plugin, header.name);
+                    if unique_header {
+                        array_unordered_remove_by_index(*plugin.marked_unique_headers, unique_index);
 
-                    array_add(*plugin.header_idents, header.library_identifier);
+                        table_set(*plugin.vague_headers, header.name, true);
+                    } else {
+                        array_add(*plugin.marked_unique_headers, header);
+                    }
+                } else {
+                    // by not having a thread mode the function is automatically vague
+                    if !table_contains(*plugin.vague_headers, header.name) {
+                        table_set(*plugin.vague_headers, header.name, true);
 
-                    // if header.polymorph_source_header {
-                    //     array_add(*plugin.header_idents, header.polymorph_source_header.library_identifier);
-                    // }
+                        unique_header, unique_index := find_marked_unique_header(plugin, header.name);
+                        if unique_header {
+                            array_unordered_remove_by_index(*plugin.marked_unique_headers, unique_index);
+                        }
+                    }
                 }
 
                 if found_unlocked {
-                    stack_path := New(StackPath);
-                    stack_path.header = header;
-                    array_add(*plugin.unlocked, stack_path);
-                }
-            }
-
-            for typechecked_body: typechecked.procedure_bodies {
-                body := typechecked_body.expression;
-                subexpressions := typechecked_body.subexpressions;
-
-                header := body.header;
-
-                table_set(*plugin.body_expressions, body, subexpressions);
-                table_set(*plugin.block_expressions, body.block, subexpressions);
-                continue;
-
-                array_add(*plugin.header_idents, header.library_identifier);
-                if header.polymorph_source_header {
-                    array_add(*plugin.header_idents, header.polymorph_source_header.library_identifier);
-                }
-
-                if header.procedure_flags & .MACRO {
-                    table_set(*plugin.body_expressions, body, subexpressions);
-                    continue;
-                }
-
-                if !is_relevant_module(plugin, header) {
-                    continue;
-                }
-
-                found_saftey_check := false;
-                for note: header.notes {
-                    found_saftey_check = found_saftey_check || equal_nocase(note.text, "thread_unlocked");
-                    found_saftey_check = found_saftey_check || equal_nocase(note.text, "thread_isolated");
-                    found_saftey_check = found_saftey_check || equal_nocase(note.text, "thread_locked");
-                    found_saftey_check = found_saftey_check || equal_nocase(note.text, "thread_safe");
-                }
-
-                if !found_saftey_check {
-                    continue;
-                }
-
-                table_set(*plugin.body_expressions, body, subexpressions);
-            }
-
-            for typechecked_all: typechecked.all {
-                // print("%\n", typechecked_all.expression.kind);
-                if typechecked_all.expression.kind == .PROCEDURE_CALL {
-                    procedure_call := cast(*Code_Procedure_Call) typechecked_all.expression;
-                    print("found typechecked procedure call %\n\n\n\n", procedure_call.*);
-                }
-
-                if typechecked_all.expression.kind == .BLOCK {
-                    block := cast(*Code_Block) typechecked_all.expression;
-                    print("found typechecked block %\n\n\n\n", block.*);
+                    array_add(*plugin.unlocked, header);
                 }
             }
 
@@ -132,21 +90,18 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
                 print("No thread safety modules found.\n");
             }
 
-            for stack_path: plugin.unlocked {
-                header_body := stack_path.header.body_or_null;
-                if !header_body {
-                    compiler_report("Thread safety marked header did not have a body.", stack_path.header.location);
-                    continue;
+            for header: plugin.unlocked {
+                if !header.body_or_null {
+                    compiler_report(plugin, "Thread safety marked header did not have a body.", header.location);
+                    return;
                 }
 
-                subexpressions, found := table_find(*plugin.body_expressions, header_body);
-                if !found {
-                    print("Could not find header: %\n", stack_path.header.name);
-                    compiler_report("Could not find typechecked code header to complete thread safety check.");
-                    continue;
-                }
+                table_set(*plugin.visited, header.body_or_null, true);
 
-                validate_unlocked(plugin, stack_path.header, subexpressions);
+                subexpressions := get_subexpressions(header.body_or_null);
+                if !validate_unlocked(plugin, subexpressions, header.name, "") {
+                    return;
+                }
             }
     }
 }
@@ -154,175 +109,178 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
 shutdown :: (plugin: *Metaprogram_Plugin) {
     using thread_safety_plugin := cast(*ThreadSafetyPlugin) plugin;
 
-    free :: (path: *StackPath) {
-        for child: path.children {
-            free(child);
-        }
-        array_free(path.children);
-        free(cast(*void) path);
-    }
-
     array_free(relevant_modules);
-    for path: unlocked {
-        free(path);
-    }
     array_free(unlocked);
-    deinit(*body_expressions);
+    deinit(*visited);
+    array_free(marked_unique_headers);
+    deinit(*vague_headers);
     free(plugin);
 }
 
 #scope_file
 
-StackPath :: struct {
-    parent: *StackPath;
-    header: *Code_Procedure_Header;
-    children: [..] *StackPath;
-}
-
 ThreadSafetyPlugin :: struct {
     #as using base: Metaprogram_Plugin;
 
     relevant_modules: [..] Message_Import;
-    unlocked: [..] *StackPath;
-    // im just guessing storing this and looking it up later is actually faster than recursing the tree
-    // but maybe there's an internal method to access subexpressions after typechecking has finished?
-    body_expressions: Table(*Code_Procedure_Body, [] *Code_Node);
-    header_idents: [..] *Code_Ident;
-    block_expressions: Table(*Code_Block, [] *Code_Node);
+    unlocked: [..] *Code_Procedure_Header;
+    // TODO should just actually use stack path for this so it's also easy to check dead lock
+    visited: Table(*Code_Node, bool);
+    // TODO this is a temporary measure until I figure out how to continue traversal past a for_expansion
+    marked_unique_headers: [..] *Code_Procedure_Header;
+    vague_headers: Table(string, bool);
+    errored: bool;
 }
 
-validate_unlocked :: (plugin: *ThreadSafetyPlugin, header: *Code_Procedure_Header, subexpressions: [] *Code_Node) -> bool {
-    print("checking header % % % %\n\n", header, header.name, header.location.enclosing_load.fully_pathed_filename, header.location.l0);
+validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node, identifier: string = "", precursor: string = "") -> bool {
+    #if DEBUG then print(precursor);
+    #if DEBUG then print("Validating: %\n", identifier);
+
     for subexpression: subexpressions {
-        print("kind %\n\n", subexpression.kind);
-        
-        if subexpression.kind == .DECLARATION {
-            decl := cast(*Code_Declaration) subexpression;
-            print("declaration %\n\n", decl.*);
-        }
-
-        if subexpression.kind == .PROCEDURE_BODY {
-            body := cast(*Code_Procedure_Body) subexpression;
-            print("body %\n\n", body.*);
-
-            print("body header % %\n\n", body.header, body.header.*);
-            print("body block %\n\n", body.block.*);
-        }
-
-        if subexpression.kind != .PROCEDURE_CALL {
-            print("Skipping: %\n", subexpression.kind);
+        if table_contains(*plugin.visited, subexpression) {
             continue;
         }
 
-        subexpression_call := cast(*Code_Procedure_Call) subexpression;
-        subexpression_call_header := subexpression_call.resolved_procedure_expression;
+        table_set(*plugin.visited, subexpression, true);
 
-        if !subexpression_call_header {
-            print("subexpression_call %\n\n", subexpression_call.*);
-            print("subexpression_call.procedure_expression %\n\n", subexpression_call.procedure_expression.*);
-            ident_pointer := cast(*Code_Ident) subexpression_call.procedure_expression;
-            print("ident %\n\n", ident_pointer.*);
-            print("found ident? %\n\n", array_find(plugin.header_idents, ident_pointer));
-            // compiler_report("Thread safety marked functions cannot make non-compile time function calls, as they cannot be safety checked.", subexpression.location);
-            continue;
-        }
+        #if DEBUG then print(precursor);
+        #if DEBUG then print("\tKind: %\n", subexpression.kind);
 
-        if subexpression_call_header.kind != .PROCEDURE_HEADER {
-            print("Got a sub expression call that's not a procedure? %\n", subexpression_call.*);
-            continue;
-        }
+        #if DEBUG {
+            if subexpression.kind == .PROCEDURE_CALL {
+                print(precursor);
+                print("\tCall: %\n", (cast(*Code_Procedure_Call) subexpression).*);
+                call_expression := (cast(*Code_Procedure_Call) subexpression).procedure_expression;
+                if call_expression {
+                    print(precursor);
+                    print("\tCall expression: %\n", call_expression.*);
 
-        subexpression_header := cast(*Code_Procedure_Header) subexpression_call_header;
+                    if call_expression.kind == .PROCEDURE_HEADER {
+                        for note: (cast(*Code_Procedure_Header) call_expression).notes {
+                            print("\n");
+                            print(precursor);
+                            print("\tFound note: %\n\n", note.text);
+                        }
+                    }
 
-        // if it's a macro we just continue passing it down
-        if subexpression_header.procedure_flags & .MACRO {
-            subexpression_body := subexpression_header.body_or_null;
-            if !subexpression_body {
-                compiler_report("Thread safety marked macro did not have a body.", subexpression.location);
-                return false;
-            }
-
-            subexpression_subexpressions, found := table_find(*plugin.body_expressions, subexpression_body);
-            if !found {
-                if !subexpression_call.macro_expansion_block {
-                    print("NO MACRO EXPANSION BLOCK FOR MACRO PROCEDURE HEADER.\n");
-                } else {
-                    subexpression_subexpressions, found = table_find(*plugin.block_expressions, subexpression_call.macro_expansion_block);
-                    print("FOUND MACRO SUBEXPRESSIONS? %\n", found);
+                    if call_expression.kind == .IDENT {
+                        print(precursor);
+                        print("\tCall ident: %\n", (cast(*Code_Ident) call_expression).*);
+                    }
                 }
 
-                compiler_report("Could not find typechecked macro header to complete thread safety check.");
-                return false;
-            }
+                call_resolved_expression := (cast(*Code_Procedure_Call) subexpression).resolved_procedure_expression;
+                if call_resolved_expression {
+                    print(precursor);
+                    print("\tResolved call expression: %\n", call_resolved_expression.*);
 
-            return validate_unlocked(plugin, subexpression_header, subexpression_subexpressions);
-        }
+                    if call_resolved_expression.kind == .PROCEDURE_HEADER {
+                        print(precursor);
+                        print("\t\tResolved call header: %\n", (cast(*Code_Procedure_Header) call_resolved_expression).*);
 
-        print("FOUND CALL % %\n\n", subexpression_header.name, subexpression_header.*);
-
-        found_isolated := false;
-        found_locked := false;
-        found_safe := false;
-        for note: subexpression_header.notes {
-            if equal_nocase(note.text, "thread_isolated") {
-                found_isolated = true;
-            } else if equal_nocase(note.text, "thread_locked") {
-                found_locked = true;
-            } else if equal_nocase(note.text, "thread_safe") {
-                found_safe = true;
+                        for note: (cast(*Code_Procedure_Header) call_resolved_expression).notes {
+                            print("\n");
+                            print(precursor);
+                            print("\tFound note: %\n\n", note.text);
+                        }
+                    }
+                }
             }
         }
 
-        if found_isolated {
-            subexpression_body := subexpression_header.body_or_null;
-            if !subexpression_body {
-                compiler_report("Thread safety marked header did not have a body.", subexpression.location);
+        if subexpression.kind == .PROCEDURE_CALL {
+            subexpression_call := cast(*Code_Procedure_Call) subexpression;
+            call_expression := subexpression_call.procedure_expression;
+            if call_expression && call_expression.kind == .PROCEDURE_HEADER {
+                compiler_report(plugin, "Got a non-resolved procedure expression that's a header? I must not understand something...", subexpression.location);
                 return false;
             }
 
-            subexpression_subexpressions, found := table_find(*plugin.body_expressions, subexpression_body);
-            if !found {
-                compiler_report("Could not find typechecked code header to complete thread safety check.");
-                return false;
+            resolved_call_expression := subexpression_call.resolved_procedure_expression;
+            if !resolved_call_expression {
+                if call_expression && call_expression.kind == .IDENT {
+                    call_ident := cast(*Code_Ident) call_expression;
+                    resolved_call_expression = find_marked_unique_header(plugin, call_ident.name);
+                }
+
+                if !resolved_call_expression {
+                    compiler_report(plugin, "Thread safety marked functions cannot make non-compile time function calls, as they cannot be safety checked. Alternatively there seems to be a bug with for_expansions where the body contents can't be recursed.\n\nNOTE: If you have a safety marked function with a unique name, it will work as a temporary workaround.", subexpression.location, .ERROR_CONTINUABLE);
+                    continue;
+                }
             }
 
-            if !validate_isolated(plugin, subexpression_header, subexpression_subexpressions) {
-                return false;
-            }
-        } else if found_locked {
-            subexpression_body := subexpression_header.body_or_null;
-            if !subexpression_body {
-                compiler_report("Thread safety marked header did not have a body.", subexpression.location);
-                return false;
-            }
+            if resolved_call_expression && resolved_call_expression.kind == .PROCEDURE_HEADER {
+                resolved_header := cast(*Code_Procedure_Header) resolved_call_expression;
 
-            subexpression_subexpressions, found := table_find(*plugin.body_expressions, subexpression_body);
-            if !found {
-                compiler_report("Could not find typechecked code header to complete thread safety check.");
-                return false;
-            }
+                found_isolated := false;
+                found_locked := false;
+                found_safe := false;
+                for note: resolved_header.notes {
+                    if equal_nocase(note.text, "thread_isolated") {
+                        found_isolated = true;
+                    } else if equal_nocase(note.text, "thread_locked") {
+                        found_locked = true;
+                    } else if equal_nocase(note.text, "thread_safe") {
+                        found_safe = true;
+                    }
+                }
 
-            if !validate_locked(plugin, subexpression_header, subexpression_subexpressions) {
+                if found_isolated {
+                    subexpressions_header := get_subexpressions(resolved_header);
+                    if !validate_unlocked(plugin, subexpressions_header, resolved_header.name, tprint("%\t", precursor)) {
+                        return false;
+                    }
+
+                    if !resolved_header.body_or_null {
+                        compiler_report(plugin, "Thread safety marked header did not have a body.", subexpression.location);
+                        return false;
+                    }
+
+                    subexpressions_body := get_subexpressions(resolved_header.body_or_null);
+                    if !validate_unlocked(plugin, subexpressions_body, resolved_header.name, tprint("%\t", precursor)) {
+                        return false;
+                    }
+                } else if found_locked {
+                    #if DEBUG then print(precursor);
+                    #if DEBUG then print("\tLock check: %\n\n", resolved_header.name);
+                    if !validate_locked(plugin, resolved_header) {
+                        return false;
+                    }
+                } else if found_safe {
+                    #if DEBUG then print(precursor);
+                    #if DEBUG then print("\tThread safe: %\n\n", resolved_header.name);
+                } else if is_relevant_module(plugin, resolved_header.location) {
+                    // if it wasn't marked isolated or locked but it's in a relevant module we reject this
+                    compiler_report(plugin, "Calling a non-thread safe function from a thread safe function in a thread safety checked module:", subexpression.location, .ERROR_CONTINUABLE);
+                } else {
+                    #if DEBUG then print("\n");
+                    #if DEBUG then print(precursor);
+                    #if DEBUG then print("\tSkipping due to module: %\n\n", resolved_header.name);
+                }
+            }
+        } else {
+            child_subexpressions := get_subexpressions(subexpression);
+            if !validate_unlocked(plugin, child_subexpressions, tprint("%.", identifier), tprint("%\t", precursor)) {
                 return false;
             }
-        } else if found_safe {
-            continue;
-        } else if is_relevant_module(plugin, subexpression_header) {
-            // if it wasn't marked isolated or locked but it's in a relevant module we reject this
-            compiler_report("Calling a non-thread safe function from a thread safe function in a thread safety checked module:", subexpression.location);
-            return false;
         }
     }
 
     return true;
 }
 
-validate_isolated :: validate_unlocked;
+// I think this maybe end up needing to be different in the future? idk
+// validate_isolated :: validate_unlocked;
 
-validate_locked :: (plugin: *ThreadSafetyPlugin, header: *Code_Procedure_Header, subexpressions: [] *Code_Node) -> bool {
+validate_locked :: (plugin: *ThreadSafetyPlugin, header: *Code_Procedure_Header) -> bool {
     // TODO check for weak deadlocks, maybe based on a setting
-
     found_lock := false;
+
+    if !header.body_or_null {
+        compiler_report(plugin, "Thread safety marked header did not have a body.", header.location);
+        return false;
+    }
+    subexpressions := get_subexpressions(header.body_or_null);
 
     for subexpression: subexpressions {
         if subexpression.kind != .PROCEDURE_CALL {
@@ -330,22 +288,30 @@ validate_locked :: (plugin: *ThreadSafetyPlugin, header: *Code_Procedure_Header,
         }
 
         subexpression_call := cast(*Code_Procedure_Call) subexpression;
-        subexpression_call_header := subexpression_call.resolved_procedure_expression;
+        call_expression := subexpression_call.procedure_expression;
+        resolved_call_expression := subexpression_call.resolved_procedure_expression;
 
-        if !subexpression_call_header {
-            compiler_report("Thread safety marked functions cannot make non-compile time function calls, as they cannot be safety checked.", subexpression.location);
+        if !resolved_call_expression {
+            if call_expression && call_expression.kind == .IDENT {
+                call_ident := cast(*Code_Ident) call_expression;
+                resolved_call_expression = find_marked_unique_header(plugin, call_ident.name);
+            }
+
+            if !resolved_call_expression {
+                compiler_report(plugin, "Thread safety marked functions cannot make non-compile time function calls, as they cannot be safety checked. Alternatively there seems to be a bug with for_expansions where the body contents can't be recursed.\n\nNOTE: If you have a safety marked function with a unique name, it will work as a temporary workaround.", subexpression.location, .ERROR_CONTINUABLE);
+                continue;
+            }
+        }
+
+        if resolved_call_expression.kind != .PROCEDURE_HEADER {
+            compiler_report(plugin, tprint("Got a subexpression call that's not a procedure? %\n", subexpression_call.*), subexpression.location);
             return false;
         }
 
-        if subexpression_call_header.kind != .PROCEDURE_HEADER {
-            print("Got a sub expression call that's not a procedure? %\n", subexpression_call.*);
-            continue;
-        }
+        resolved_header := cast(*Code_Procedure_Header) resolved_call_expression;
 
-        subexpression_header := cast(*Code_Procedure_Header) subexpression_call_header;
-
-        if subexpression_header.name == "lock" || subexpression_header.name == "wait_for" {
-            enclosing_load := subexpression_header.base.location.enclosing_load;
+        if resolved_header.name == "lock" || resolved_header.name == "wait_for" {
+            enclosing_load := resolved_header.base.location.enclosing_load;
             if enclosing_load && enclosing_load.enclosing_import {
                 module_name := enclosing_load.enclosing_import.module_name;
                 if module_name == "Thread" {
@@ -357,15 +323,14 @@ validate_locked :: (plugin: *ThreadSafetyPlugin, header: *Code_Procedure_Header,
     }
 
     if !found_lock {
-        compiler_report("Thread saftey function marked thread_locked did not contain a mutex lock.", header.location);
-        return false;
+        compiler_report(plugin, "Thread saftey function marked thread_locked did not lock a mutex or wait_for a semaphore.", header.location, .ERROR_CONTINUABLE);
     }
     
     return true;
 }
 
-is_relevant_module :: (plugin: *ThreadSafetyPlugin, header: *Code_Procedure_Header) -> bool {
-    enclosing_load := header.base.location.enclosing_load;
+is_relevant_module :: (plugin: *ThreadSafetyPlugin, location: Code_Node.Location) -> bool {
+    enclosing_load := location.enclosing_load;
     return enclosing_load && enclosing_load.enclosing_import && is_relevant_module(plugin, enclosing_load.enclosing_import);
 }
 
@@ -390,16 +355,42 @@ add_relevant_module :: (plugin: *ThreadSafetyPlugin, module: Message_Import) {
     array_add(*plugin.relevant_modules, module);
 }
 
-compiler_report :: (error_text: string, location: Code_Node.Location, mode := Report.ERROR) {
+compiler_report :: (plugin: *ThreadSafetyPlugin, error_text: string, location: Code_Node.Location, mode := Report.ERROR) {
     loc: Source_Code_Location;
     loc.fully_pathed_filename = location.enclosing_load.fully_pathed_filename;
     loc.line_number           = location.l0;
     loc.character_number      = location.c0;
 
     compiler_report(error_text, loc, mode);
+
+    if mode == .ERROR || mode == .ERROR_CONTINUABLE {
+        compiler_set_workspace_status(.FAILED, plugin.workspace);
+    }
+}
+
+get_subexpressions :: (node: *Code_Node) -> [] *Code_Node {
+    // TODO shouldn't I just let this leak memory since that's probably faster
+    // than some double allocation that's probably never freed anyways
+    subexpressions: [..] *Code_Node;
+    subexpressions.allocator = temp;
+
+    get_recursive_nodes_breadth_first(node, *subexpressions);
+
+    return subexpressions;
+}
+
+find_marked_unique_header :: (plugin: *ThreadSafetyPlugin, name: string) -> *Code_Procedure_Header, int {
+    for header, index: plugin.marked_unique_headers {
+        if header.name == name {
+            return header, index;
+        }
+    }
+
+    return null, -1;
 }
 
 #import "Basic";
+#import "Code_Visit";
 #import "Compiler";
 #import "Hash_Table";
 #import "String";
