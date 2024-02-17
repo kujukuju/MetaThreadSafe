@@ -129,8 +129,7 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
 
                 table_set(visited, header.body_or_null, true);
 
-                subexpressions := get_subexpressions(header.body_or_null);
-                if !validate_unlocked(plugin, subexpressions, visited, mutex_options, *locked_mutexes, maybe_tprint("%_%", header.name, header.kind)) {
+                if !validate_unlocked(plugin, header.body_or_null, visited, mutex_options, *locked_mutexes, maybe_tprint("%_%", header.name, header.kind)) {
                     return;
                 }
 
@@ -175,37 +174,39 @@ ThreadSafetyPlugin :: struct {
     marked_unique_headers: [..] *Code_Procedure_Header;
     vague_headers: Table(string, bool);
     mutex_options: Table(string, Table(*Code_Procedure_Header, [..] *Code_Node));
-    deferred_subexpressions_available: [..] [..] *Code_Node;
+    recycled_subexpressions: [..] [..] *Code_Node;
     duration: float64;
     failed: bool;
 }
 
-validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node, visited: *Table(*Code_Node, bool), mutex_options: *Table(*Code_Procedure_Header, [..] *Code_Node), locked_mutexes: *[..] *Code_Node, identifier: string = "", precursor: string = "") -> bool {
+validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *Table(*Code_Node, bool), mutex_options: *Table(*Code_Procedure_Header, [..] *Code_Node), locked_mutexes: *[..] *Code_Node, identifier: string = "", precursor: string = "") -> bool {
     #if DEBUG then print("\n");
     #if DEBUG then print(precursor);
     #if DEBUG then print("Validating: %\n", identifier);
 
-    // pop out an available array if we can and add it back it when we're done
-    deferred_subexpressions: [..] *Code_Node;
-    // if plugin.deferred_subexpressions_available.count > 0 {
-    //     deferred_subexpressions = plugin.deferred_subexpressions_available[plugin.deferred_subexpressions_available.count - 1];
-    //     plugin.deferred_subexpressions_available.count -= 1;
-    // }
-    // defer array_add(*plugin.deferred_subexpressions_available, deferred_subexpressions);
-
-    if deferred_subexpressions.allocated < subexpressions.count {
-        array_reserve(*deferred_subexpressions, subexpressions.count);
+    subexpressions: [..] *Code_Node;
+    if plugin.recycled_subexpressions.count > 0 {
+        subexpressions = plugin.recycled_subexpressions[plugin.recycled_subexpressions.count - 1];
+        plugin.recycled_subexpressions.count -= 1;
     }
-    deferred_subexpressions.count = subexpressions.count;
+    defer array_add(*plugin.recycled_subexpressions, subexpressions);
+
+    subexpressions.count = 0;
+    get_subexpressions(node, *subexpressions);
 
     normal_index := 0;
-    defer_index := subexpressions.count - 1;
-    for subexpression: subexpressions {
-        if subexpression.kind == .DEFER {
-            deferred_subexpressions[defer_index] = subexpression;
-            defer_index -= 1;
+    deferred_index := subexpressions.count - 1;
+
+    // move deferred to the back in place
+    for i: 0..subexpressions.count - 1 {
+        if subexpressions[normal_index].kind == .DEFER {
+            deferred := subexpressions[normal_index];
+            for a: normal_index..deferred_index - 1 {
+                subexpressions[a] = subexpressions[a + 1];
+            }
+            subexpressions[deferred_index] = deferred;
+            deferred_index -= 1;
         } else {
-            deferred_subexpressions[normal_index] = subexpression;
             normal_index += 1;
         }
     }
@@ -213,13 +214,13 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
     #if DEBUG {
         print(precursor);
         print("Subexpressions: ");
-        for subexpression: deferred_subexpressions {
+        for subexpression: subexpressions {
             print("% ", subexpression.kind);
         }
         print("\n");
     }
 
-    for subexpression: deferred_subexpressions {
+    for subexpression: subexpressions {
         if table_contains(visited, subexpression) {
             continue;
         }
@@ -300,8 +301,7 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
                 }
 
                 if found_isolated {
-                    subexpressions_header := get_subexpressions(resolved_header);
-                    if !validate_unlocked(plugin, subexpressions_header, visited, mutex_options, locked_mutexes, maybe_tprint("%_%", resolved_header.name, resolved_header.kind), maybe_tprint("%\t", precursor)) {
+                    if !validate_unlocked(plugin, resolved_header, visited, mutex_options, locked_mutexes, maybe_tprint("%_%", resolved_header.name, resolved_header.kind), maybe_tprint("%\t", precursor)) {
                         return false;
                     }
 
@@ -310,8 +310,7 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
                         return false;
                     }
 
-                    subexpressions_body := get_subexpressions(resolved_header.body_or_null);
-                    if !validate_unlocked(plugin, subexpressions_body, visited, mutex_options, locked_mutexes, maybe_tprint("%_%", resolved_header.name, resolved_header.kind), maybe_tprint("%\t", precursor)) {
+                    if !validate_unlocked(plugin, resolved_header.body_or_null, visited, mutex_options, locked_mutexes, maybe_tprint("%_%", resolved_header.name, resolved_header.kind), maybe_tprint("%\t", precursor)) {
                         return false;
                     }
                 } else if found_safe {
@@ -397,13 +396,11 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
 
                         // these are the only cases where we will essentially skip processing the if subexpression
                         if go_then {
-                            child_subexpressions := get_subexpressions(code_if.then_block);
-                            if !validate_unlocked(plugin, child_subexpressions, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, code_if.then_block.kind), maybe_tprint("%\t", precursor)) {
+                            if !validate_unlocked(plugin, code_if.then_block, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, code_if.then_block.kind), maybe_tprint("%\t", precursor)) {
                                 return false;
                             }
                         } else {
-                            child_subexpressions := get_subexpressions(code_if.else_block);
-                            if !validate_unlocked(plugin, child_subexpressions, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, code_if.else_block.kind), maybe_tprint("%\t", precursor)) {
+                            if !validate_unlocked(plugin, code_if.else_block, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, code_if.else_block.kind), maybe_tprint("%\t", precursor)) {
                                 return false;
                             }
                         }
@@ -417,13 +414,11 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
             }
 
             // if we can't evaluate the static if statement we just continue
-            child_subexpressions := get_subexpressions(subexpression);
-            if !validate_unlocked(plugin, child_subexpressions, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, subexpression.kind), maybe_tprint("%\t", precursor)) {
+            if !validate_unlocked(plugin, subexpression, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, subexpression.kind), maybe_tprint("%\t", precursor)) {
                 return false;
             }
         } else {
-            child_subexpressions := get_subexpressions(subexpression);
-            if !validate_unlocked(plugin, child_subexpressions, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, subexpression.kind), maybe_tprint("%\t", precursor)) {
+            if !validate_unlocked(plugin, subexpression, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, subexpression.kind), maybe_tprint("%\t", precursor)) {
                 return false;
             }
         }
@@ -469,18 +464,6 @@ compiler_report :: (plugin: *ThreadSafetyPlugin, error_text: string, location: C
     if !plugin.failed && (mode == .ERROR || mode == .ERROR_CONTINUABLE) {
         plugin.failed = true;
     }
-}
-
-get_subexpressions :: (node: *Code_Node) -> [] *Code_Node {
-    // TODO shouldn't I just let this leak memory since that's probably faster
-    // than some double allocation that's probably never freed anyways
-    subexpressions: [..] *Code_Node;
-    subexpressions.allocator = temp;
-
-    get_subexpressions(node, *subexpressions);
-    // get_recursive_nodes_breadth_first(node, *subexpressions);
-
-    return subexpressions;
 }
 
 find_marked_unique_header :: (plugin: *ThreadSafetyPlugin, name: string) -> *Code_Procedure_Header, int {
