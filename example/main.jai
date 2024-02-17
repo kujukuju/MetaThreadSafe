@@ -17,7 +17,7 @@
 
     compiler_begin_intercept(w, intercept_flags);
 
-    add_build_file("defer_example.jai", w);
+    add_build_file("struct_lock_example.jai", w);
 
     while true {
         message := compiler_wait_for_message();

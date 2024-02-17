@@ -21,6 +21,9 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
 
     if message.kind == {
         case .TYPECHECKED;
+            start := seconds_since_init();
+            defer plugin.duration += seconds_since_init() - start;
+
             typechecked := cast(*Message_Typechecked) message;
             for typechecked_header: typechecked.procedure_headers {
                 header := typechecked_header.expression;
@@ -68,6 +71,9 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
             }
 
         case .COMPLETE;
+            start := seconds_since_init();
+            defer plugin.duration += seconds_since_init() - start;
+
             if plugin.relevant_modules.count > 0 {
                 print("Thread safety modules: ");
                 for module, index: plugin.relevant_modules {
@@ -143,6 +149,8 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
 shutdown :: (plugin: *Metaprogram_Plugin) {
     using thread_safety_plugin := cast(*ThreadSafetyPlugin) plugin;
 
+    print("Thread safety check took % seconds.\n", duration);
+
     // array_free(relevant_modules);
     // array_free(unlocked);
     // deinit(*visited);
@@ -166,7 +174,8 @@ ThreadSafetyPlugin :: struct {
     marked_unique_headers: [..] *Code_Procedure_Header;
     vague_headers: Table(string, bool);
     mutex_options: Table(string, Table(*Code_Procedure_Header, [..] *Code_Node));
-    deferred_subexpressions: [..] *Code_Node;
+    deferred_subexpressions_available: [..] [..] *Code_Node;
+    duration: float64;
     failed: bool;
 }
 
@@ -174,24 +183,32 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
     #if DEBUG then print(precursor);
     #if DEBUG then print("Validating: %\n", identifier);
 
-    if plugin.deferred_subexpressions.allocated < subexpressions.count {
-        array_reserve(*plugin.deferred_subexpressions, subexpressions.count);
+    // pop out an available array if we can and add it back it when we're done
+    deferred_subexpressions: [..] *Code_Node;
+    // if plugin.deferred_subexpressions_available.count > 0 {
+    //     deferred_subexpressions = plugin.deferred_subexpressions_available[plugin.deferred_subexpressions_available.count - 1];
+    //     plugin.deferred_subexpressions_available.count -= 1;
+    // }
+    // defer array_add(*plugin.deferred_subexpressions_available, deferred_subexpressions);
+
+    if deferred_subexpressions.allocated < subexpressions.count {
+        array_reserve(*deferred_subexpressions, subexpressions.count);
     }
-    plugin.deferred_subexpressions.count = subexpressions.count;
+    deferred_subexpressions.count = subexpressions.count;
 
     normal_index := 0;
     defer_index := subexpressions.count - 1;
     for subexpression: subexpressions {
         if subexpression.kind == .DEFER {
-            plugin.deferred_subexpressions[defer_index] = subexpression;
+            deferred_subexpressions[defer_index] = subexpression;
             defer_index -= 1;
         } else {
-            plugin.deferred_subexpressions[normal_index] = subexpression;
+            deferred_subexpressions[normal_index] = subexpression;
             normal_index += 1;
         }
     }
 
-    for subexpression: plugin.deferred_subexpressions {
+    for subexpression: deferred_subexpressions {
         if table_contains(visited, subexpression) {
             continue;
         }
@@ -332,6 +349,8 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
                             compiler_report(plugin, "Locking the same mutex twice before unlocking. If this is wrong and you have special mutex logic, then don't give your thread_unlocked a name.", subexpression.location, .ERROR_CONTINUABLE);
                             continue;
                         }
+
+                        #if DEBUG then compiler_report(plugin, "Found locked mutex:", subexpression.location, .INFO);
                         
                         array_add(locked_mutexes, locked_mutex);
                     } else {
@@ -341,6 +360,8 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
                                 compiler_report(plugin, "Unlocking a mutex that's not locked. If this is wrong and you have special mutex logic, then don't give your thread_unlocked a name.", subexpression.location, .ERROR_CONTINUABLE);
                                 continue;
                             }
+
+                            #if DEBUG then compiler_report(plugin, "Found unlocked mutex:", subexpression.location, .INFO);
 
                             array_ordered_remove_by_value(locked_mutexes, unlocked_mutex);
                         }
@@ -423,19 +444,17 @@ find_marked_unique_header :: (plugin: *ThreadSafetyPlugin, name: string) -> *Cod
 }
 
 get_maybe_locked_mutex :: (plugin: *ThreadSafetyPlugin, header: *Code_Procedure_Header, call: *Code_Procedure_Call) -> *Code_Node {
-    valid_header := false;
-
-    if header.name == "lock" {
-        enclosing_load := header.base.location.enclosing_load;
-        if enclosing_load && enclosing_load.enclosing_import {
-            module_name := enclosing_load.enclosing_import.module_name;
-            if module_name == "Thread" {
-                valid_header = true;
-            }
-        }
+    if header.name != "lock" {
+        return null;
     }
 
-    if !valid_header {
+    enclosing_load := header.base.location.enclosing_load;
+    if !enclosing_load || !enclosing_load.enclosing_import {
+        return null;
+    }
+
+    module_name := enclosing_load.enclosing_import.module_name;
+    if module_name != "Thread" {
         return null;
     }
 
@@ -448,32 +467,28 @@ get_maybe_locked_mutex :: (plugin: *ThreadSafetyPlugin, header: *Code_Procedure_
     argument := arguments[0];
     if argument.expression && argument.expression.kind == .UNARY_OPERATOR {
         unary := cast(*Code_Unary_Operator) argument.expression;
-        if unary.subexpression && unary.subexpression.kind == .IDENT {
-            ident := cast(*Code_Ident) unary.subexpression;
 
+        ident := get_declaration_ident(plugin, unary);
+        if ident {
             return ident.resolved_declaration;
         }
-
-        return unary;
     }
 
     return null;
 }
 
 get_maybe_unlocked_mutex :: (plugin: *ThreadSafetyPlugin, header: *Code_Procedure_Header, call: *Code_Procedure_Call) -> *Code_Node {
-    valid_header := false;
-
-    if header.name == "unlock" {
-        enclosing_load := header.base.location.enclosing_load;
-        if enclosing_load && enclosing_load.enclosing_import {
-            module_name := enclosing_load.enclosing_import.module_name;
-            if module_name == "Thread" {
-                valid_header = true;
-            }
-        }
+    if header.name != "unlock" {
+        return null;
     }
 
-    if !valid_header {
+    enclosing_load := header.base.location.enclosing_load;
+    if !enclosing_load || !enclosing_load.enclosing_import {
+        return null;
+    }
+
+    module_name := enclosing_load.enclosing_import.module_name;
+    if module_name != "Thread" {
         return null;
     }
 
@@ -486,14 +501,40 @@ get_maybe_unlocked_mutex :: (plugin: *ThreadSafetyPlugin, header: *Code_Procedur
     argument := arguments[0];
     if argument.expression && argument.expression.kind == .UNARY_OPERATOR {
         unary := cast(*Code_Unary_Operator) argument.expression;
-        if unary.subexpression && unary.subexpression.kind == .IDENT {
-            ident := cast(*Code_Ident) unary.subexpression;
 
+        ident := get_declaration_ident(plugin, unary);
+        if ident {
             return ident.resolved_declaration;
         }
     }
 
     return null;
+}
+
+get_declaration_ident :: (plugin: *ThreadSafetyPlugin, unary: *Code_Unary_Operator) -> *Code_Ident {
+    while unary.subexpression && unary.subexpression.kind == .UNARY_OPERATOR {
+        unary = cast(*Code_Unary_Operator) unary.subexpression;
+    }
+
+    if unary.subexpression && unary.subexpression.kind == .IDENT {
+        return cast(*Code_Ident) unary.subexpression;
+    } else if unary.subexpression && unary.subexpression.kind == .BINARY_OPERATOR {
+        return get_declaration_ident(plugin, cast(*Code_Binary_Operator) unary.subexpression);
+    }
+
+    return null;
+}
+
+get_declaration_ident :: (plugin: *ThreadSafetyPlugin, binary: *Code_Binary_Operator) -> *Code_Ident {
+    while binary.right && binary.right.kind == .BINARY_OPERATOR {
+        binary = cast(*Code_Binary_Operator) binary.right;
+    }
+
+    if binary.right && binary.right.kind == .IDENT {
+        return cast(*Code_Ident) binary.right;
+    } else if binary.right && binary.right.kind == .UNARY_OPERATOR {
+        return get_declaration_ident(plugin, cast(*Code_Unary_Operator) binary.right);
+    }
 }
 
 #import "Basic";
