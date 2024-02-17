@@ -2,11 +2,11 @@
 main :: () {
     init(*mutex);
 
-    function();
+    function(true);
 } @thread_unlocked
 
-function :: () {
-    #if true {
+function :: ($async: bool) {
+    #if async {
         safe();
     } else {
         unsafe();
@@ -14,10 +14,10 @@ function :: () {
 } @thread
 
 safe :: () {
-    lock(*thing.thing.inner_mutex);
-    defer unlock(*thing.thing.inner_mutex);
+    lock(*mutex);
+    defer unlock(*mutex);
 
-    unsafe3();
+    unsafe();
 } @thread
 
 unsafe :: () {

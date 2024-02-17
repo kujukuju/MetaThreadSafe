@@ -66,6 +66,7 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
                 }
 
                 if found_unlocked {
+                    #if DEBUG then print("Found thread_unlocked: %\n", header.name);
                     array_add(*plugin.unlocked, header);
                 }
             }
@@ -129,7 +130,7 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
                 table_set(visited, header.body_or_null, true);
 
                 subexpressions := get_subexpressions(header.body_or_null);
-                if !validate_unlocked(plugin, subexpressions, visited, mutex_options, *locked_mutexes, header.name) {
+                if !validate_unlocked(plugin, subexpressions, visited, mutex_options, *locked_mutexes, maybe_tprint("%_%", header.name, header.kind)) {
                     return;
                 }
 
@@ -180,6 +181,7 @@ ThreadSafetyPlugin :: struct {
 }
 
 validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node, visited: *Table(*Code_Node, bool), mutex_options: *Table(*Code_Procedure_Header, [..] *Code_Node), locked_mutexes: *[..] *Code_Node, identifier: string = "", precursor: string = "") -> bool {
+    #if DEBUG then print("\n");
     #if DEBUG then print(precursor);
     #if DEBUG then print("Validating: %\n", identifier);
 
@@ -208,6 +210,15 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
         }
     }
 
+    #if DEBUG {
+        print(precursor);
+        print("Subexpressions: ");
+        for subexpression: deferred_subexpressions {
+            print("% ", subexpression.kind);
+        }
+        print("\n");
+    }
+
     for subexpression: deferred_subexpressions {
         if table_contains(visited, subexpression) {
             continue;
@@ -226,14 +237,6 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
                 if call_expression {
                     print(precursor);
                     print("\tCall expression: %\n", call_expression.*);
-
-                    if call_expression.kind == .PROCEDURE_HEADER {
-                        for note: (cast(*Code_Procedure_Header) call_expression).notes {
-                            print("\n");
-                            print(precursor);
-                            print("\tFound note: %\n\n", note.text);
-                        }
-                    }
 
                     if call_expression.kind == .IDENT {
                         print(precursor);
@@ -264,8 +267,10 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
             subexpression_call := cast(*Code_Procedure_Call) subexpression;
             call_expression := subexpression_call.procedure_expression;
             if call_expression && call_expression.kind == .PROCEDURE_HEADER {
-                compiler_report(plugin, "Got a non-resolved procedure expression that's a header? I must not understand something...", subexpression.location);
-                return false;
+                // this can be like a #run () -> {}() thing
+                // compiler_report(plugin, "Got a non-resolved procedure expression that's a header? I must not understand something...", subexpression.location);
+                continue;
+                // return false;
             }
 
             resolved_call_expression := subexpression_call.resolved_procedure_expression;
@@ -296,7 +301,7 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
 
                 if found_isolated {
                     subexpressions_header := get_subexpressions(resolved_header);
-                    if !validate_unlocked(plugin, subexpressions_header, visited, mutex_options, locked_mutexes, resolved_header.name, tprint("%\t", precursor)) {
+                    if !validate_unlocked(plugin, subexpressions_header, visited, mutex_options, locked_mutexes, maybe_tprint("%_%", resolved_header.name, resolved_header.kind), maybe_tprint("%\t", precursor)) {
                         return false;
                     }
 
@@ -306,7 +311,7 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
                     }
 
                     subexpressions_body := get_subexpressions(resolved_header.body_or_null);
-                    if !validate_unlocked(plugin, subexpressions_body, visited, mutex_options, locked_mutexes, resolved_header.name, tprint("%\t", precursor)) {
+                    if !validate_unlocked(plugin, subexpressions_body, visited, mutex_options, locked_mutexes, maybe_tprint("%_%", resolved_header.name, resolved_header.kind), maybe_tprint("%\t", precursor)) {
                         return false;
                     }
                 } else if found_safe {
@@ -341,7 +346,7 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
                     }
 
                     #if DEBUG then print(precursor);
-                    #if DEBUG then print("\tHeader % was save due to mutex locks: % %\n", resolved_header.name, locked_mutexes.*);
+                    #if DEBUG then print("\tHeader % was safe due to mutex locks: %\n", resolved_header.name, locked_mutexes.*);
                 } else {
                     locked_mutex := get_maybe_locked_mutex(plugin, resolved_header, subexpression_call);
                     if locked_mutex {
@@ -372,9 +377,53 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, subexpressions: [] *Code_Node
                     #if DEBUG then print("\tSkipping due to module: %\n\n", resolved_header.name);
                 }
             }
+        } if subexpression.kind == .IF && (cast(*Code_If) subexpression).is_static {
+            // we want to try to skip static ifs if the result is known at compile time and simple
+            code_if := cast(*Code_If) subexpression;
+            #if DEBUG then print(precursor);
+            #if DEBUG then print("\tStsatic if: %\n", code_if.*);
+
+            if code_if.condition && code_if.condition.kind == .IDENT {
+                condition_ident := cast(*Code_Ident) code_if.condition;
+
+                #if DEBUG then print(precursor);
+                #if DEBUG then print("\tStatic ident: %\n", condition_ident.*);
+                
+                if condition_ident.resolved_declaration && condition_ident.resolved_declaration.expression {
+                    expression := condition_ident.resolved_declaration.expression;
+                    if expression.kind == .LITERAL {
+                        literal := cast(*Code_Literal) expression;
+                        go_then := literal.value_type == .TRUE;
+
+                        // these are the only cases where we will essentially skip processing the if subexpression
+                        if go_then {
+                            child_subexpressions := get_subexpressions(code_if.then_block);
+                            if !validate_unlocked(plugin, child_subexpressions, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, code_if.then_block.kind), maybe_tprint("%\t", precursor)) {
+                                return false;
+                            }
+                        } else {
+                            child_subexpressions := get_subexpressions(code_if.else_block);
+                            if !validate_unlocked(plugin, child_subexpressions, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, code_if.else_block.kind), maybe_tprint("%\t", precursor)) {
+                                return false;
+                            }
+                        }
+
+                        continue;
+                    }
+                }
+            } else if code_if.condition {
+                #if DEBUG then print(precursor);
+                #if DEBUG then print("\tUnhandled static condition: %\n", code_if.condition.*);
+            }
+
+            // if we can't evaluate the static if statement we just continue
+            child_subexpressions := get_subexpressions(subexpression);
+            if !validate_unlocked(plugin, child_subexpressions, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, subexpression.kind), maybe_tprint("%\t", precursor)) {
+                return false;
+            }
         } else {
             child_subexpressions := get_subexpressions(subexpression);
-            if !validate_unlocked(plugin, child_subexpressions, visited, mutex_options, locked_mutexes, tprint("%.", identifier), tprint("%\t", precursor)) {
+            if !validate_unlocked(plugin, child_subexpressions, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, subexpression.kind), maybe_tprint("%\t", precursor)) {
                 return false;
             }
         }
@@ -428,7 +477,8 @@ get_subexpressions :: (node: *Code_Node) -> [] *Code_Node {
     subexpressions: [..] *Code_Node;
     subexpressions.allocator = temp;
 
-    get_recursive_nodes_breadth_first(node, *subexpressions);
+    get_subexpressions(node, *subexpressions);
+    // get_recursive_nodes_breadth_first(node, *subexpressions);
 
     return subexpressions;
 }
@@ -537,6 +587,14 @@ get_declaration_ident :: (plugin: *ThreadSafetyPlugin, binary: *Code_Binary_Oper
     }
 
     return null;
+}
+
+maybe_tprint :: (format_string: string, args: ..Any) -> string {
+    #if DEBUG {
+        return tprint(format_string, ..args);
+    }
+
+    return "";
 }
 
 #import "Basic";
