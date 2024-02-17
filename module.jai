@@ -535,6 +535,8 @@ get_declaration_ident :: (plugin: *ThreadSafetyPlugin, binary: *Code_Binary_Oper
     } else if binary.right && binary.right.kind == .UNARY_OPERATOR {
         return get_declaration_ident(plugin, cast(*Code_Unary_Operator) binary.right);
     }
+
+    return null;
 }
 
 #import "Basic";

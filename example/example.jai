@@ -26,7 +26,7 @@ locked_call :: () {
     
     thing := pow(2.0, 2.0);
     unsafe_call();
-} @thread_locked
+} @thread
 
 isolated_call :: () {
 
