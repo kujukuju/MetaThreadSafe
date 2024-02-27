@@ -100,7 +100,7 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
 
             for header: plugin.unlocked {
                 if !header.body_or_null {
-                    compiler_report(plugin, "Thread safety marked header did not have a body.", header.location);
+                    compiler_report(plugin, "Thread safety marked header did not have a body. Or there was a previous error.", header.location);
                     return;
                 }
 
@@ -306,7 +306,7 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *T
                     }
 
                     if !resolved_header.body_or_null {
-                        compiler_report(plugin, "Thread safety marked header did not have a body.", subexpression.location);
+                        compiler_report(plugin, "Thread safety marked header did not have a body. Or there was a previous error.", subexpression.location);
                         return false;
                     }
 
