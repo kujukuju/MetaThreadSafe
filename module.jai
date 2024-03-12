@@ -392,7 +392,8 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *T
                     expression := condition_ident.resolved_declaration.expression;
                     if expression.kind == .LITERAL {
                         literal := cast(*Code_Literal) expression;
-                        go_then := literal.value_type == .TRUE;
+                        go_then := literal.value_type == .BOOLEAN;
+                        go_then = go_then && !!literal._u64;
 
                         // these are the only cases where we will essentially skip processing the if subexpression
                         if go_then {
