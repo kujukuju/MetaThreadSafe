@@ -18,6 +18,10 @@ before_intercept :: (plugin: *Metaprogram_Plugin, flags: *Intercept_Flags) {
 
 message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
     plugin := cast(*ThreadSafetyPlugin) metaprogram_plugin;
+    
+    if plugin.program_failed {
+        return;
+    }
 
     if message.kind == {
         case .TYPECHECKED;
@@ -143,6 +147,9 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
             if plugin.failed {
                 compiler_set_workspace_status(.FAILED, plugin.workspace);
             }
+
+        case .ERROR;
+            plugin.program_failed = true;
     }
 }
 
@@ -177,6 +184,7 @@ ThreadSafetyPlugin :: struct {
     recycled_subexpressions: [..] [..] *Code_Node;
     duration: float64;
     failed: bool;
+    program_failed: bool;
 }
 
 validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *Table(*Code_Node, bool), mutex_options: *Table(*Code_Procedure_Header, [..] *Code_Node), locked_mutexes: *[..] *Code_Node, identifier: string = "", precursor: string = "") -> bool {

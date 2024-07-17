@@ -33,6 +33,12 @@ This metaprogram will automatically safety check any modules that use any thread
 
 ---
 
+#### TODO
+
+I want to add a @thread_tracked that you can add annotations to just variables of things, and anything that ever touches that variable will be treated like an unsafe function and require a mutex lock.
+
+---
+
 It wouldn't be that hard to extend this to deadlock detection where you check you're ever dependent on one lock releasing before another happens to be acquired. But I'm not sure if this is always a valid rule?
 
 I could also continue recursing past the first unsafe entry (with a mutex lock) to ensure that any other function calls down the chain use the same mutex lock. Without this, you could use two different mutexes to access the same function but at different points in the stack, where one might be deep enough into unsafe territory to avoid being checked.
