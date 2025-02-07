@@ -18,7 +18,7 @@ before_intercept :: (plugin: *Metaprogram_Plugin, flags: *Intercept_Flags) {
 
 message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
     plugin := cast(*ThreadSafetyPlugin) metaprogram_plugin;
-    
+
     if plugin.program_failed {
         return;
     }
@@ -123,7 +123,7 @@ message :: (metaprogram_plugin: *Metaprogram_Plugin, message: *Message) {
                     unlocked_name.count = unlocked_string.count - no_name_count - 2;
                 }
 
-                unlocked_name = to_lower_copy_new(unlocked_name,, allocator = temp);
+                unlocked_name = to_lower_copy(unlocked_name,, allocator = temp);
 
                 // TODO this could technically fail in some scenarios where you're entering the same function through 2 different routes within the same name
                 // in that case, it would only traverse the given function once, while the mutex locks could be different in both scenarios
@@ -180,14 +180,15 @@ ThreadSafetyPlugin :: struct {
     // TODO this is a temporary measure until I figure out how to continue traversal past a for_expansion
     marked_unique_headers: [..] *Code_Procedure_Header;
     vague_headers: Table(string, bool);
-    mutex_options: Table(string, Table(*Code_Procedure_Header, [..] *Code_Node));
+    mutex_options: Table(string, Table(*Code_Node, [..] *Code_Node));
     recycled_subexpressions: [..] [..] *Code_Node;
+    tracked_nodes: [..] *Code_Node;
     duration: float64;
     failed: bool;
     program_failed: bool;
 }
 
-validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *Table(*Code_Node, bool), mutex_options: *Table(*Code_Procedure_Header, [..] *Code_Node), locked_mutexes: *[..] *Code_Node, identifier: string = "", precursor: string = "") -> bool {
+validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *Table(*Code_Node, bool), mutex_options: *Table(*Code_Node, [..] *Code_Node), locked_mutexes: *[..] *Code_Node, identifier: string = "", precursor: string = "") -> bool {
     #if DEBUG then print("\n");
     #if DEBUG then print(precursor);
     #if DEBUG then print("Validating: %\n", identifier);
@@ -205,7 +206,7 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *T
     normal_index := 0;
     deferred_index := subexpressions.count - 1;
 
-    // move deferred to the back in place
+    // move deferred to the back, in place
     for i: 0..subexpressions.count - 1 {
         if subexpressions[normal_index].kind == .DEFER {
             deferred := subexpressions[normal_index];
@@ -232,7 +233,6 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *T
         if table_contains(visited, subexpression) {
             continue;
         }
-
         table_set(visited, subexpression, true);
 
         #if DEBUG then print(precursor);
@@ -272,6 +272,15 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *T
             }
         }
 
+        plugin.tracked_nodes.count = 0;
+        get_tracked(plugin, subexpression, *plugin.tracked_nodes, false);
+        for tracked: plugin.tracked_nodes {
+            if validate_mutex(plugin, tracked, mutex_options, locked_mutexes, tracked.location, precursor) {
+                // get_tracked(plugin, subexpression, *plugin.tracked_nodes, true);
+                continue subexpression;
+            }
+        }
+
         if subexpression.kind == .PROCEDURE_CALL {
             subexpression_call := cast(*Code_Procedure_Call) subexpression;
             call_expression := subexpression_call.procedure_expression;
@@ -287,6 +296,10 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *T
                 if call_expression && call_expression.kind == .IDENT {
                     call_ident := cast(*Code_Ident) call_expression;
                     resolved_call_expression = find_marked_unique_header(plugin, call_ident.name);
+
+                    if is_external_module_WORKAROUND(call_ident.name) {
+                        continue;
+                    }
                 }
 
                 if !resolved_call_expression {
@@ -325,35 +338,9 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *T
                     #if DEBUG then print(precursor);
                     #if DEBUG then print("\tThread safe: %\n\n", resolved_header.name);
                 } else if is_relevant_module(plugin, resolved_header.location) {
-                    if locked_mutexes.count == 0 {
-                        compiler_report(plugin, "Calling a non-thread safe function from a thread safe function in a thread safety checked module. Without a locked mutex.", subexpression.location, .ERROR_CONTINUABLE);
+                    if validate_mutex(plugin, resolved_header, mutex_options, locked_mutexes, subexpression.location, precursor) {
                         continue;
                     }
-
-                    options := find_or_add(mutex_options, resolved_header);
-                    if options.count == 0 {
-                        // if there aren't yet any required mutexes, then add all of our locked mutexes
-                        array_add(options, ..(locked_mutexes.*));
-                    } else {
-                        i := 0;
-                        while i < options.count {
-                            // if the optional mutex isn't currently locked, we remove it from the requirement list as it's no longer a valid lock holder
-                            if !array_find(locked_mutexes.*, options.*[i]) {
-                                array_ordered_remove_by_index(options, i);
-                            } else {
-                                i += 1;
-                            }
-                        }
-
-                        // if there are no more optional mutexes left after locked mutex intersection, then it's no longer a valid call
-                        if options.count == 0 {
-                            compiler_report(plugin, "Calling a non-thread safe function and all mutexes that were expected to be locked, as indicated by other calls to this same function, weren't.", subexpression.location, .ERROR_CONTINUABLE);
-                            continue;
-                        }
-                    }
-
-                    #if DEBUG then print(precursor);
-                    #if DEBUG then print("\tHeader % was safe due to mutex locks: %\n", resolved_header.name, locked_mutexes.*);
                 } else {
                     locked_mutex := get_maybe_locked_mutex(plugin, resolved_header, subexpression_call);
                     if locked_mutex {
@@ -363,7 +350,7 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *T
                         }
 
                         #if DEBUG then compiler_report(plugin, "Found locked mutex:", subexpression.location, .INFO);
-                        
+
                         array_add(locked_mutexes, locked_mutex);
                     } else {
                         unlocked_mutex := get_maybe_unlocked_mutex(plugin, resolved_header, subexpression_call);
@@ -384,48 +371,58 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *T
                     #if DEBUG then print("\tSkipping due to module: %\n\n", resolved_header.name);
                 }
             }
-        } if subexpression.kind == .IF && (cast(*Code_If) subexpression).is_static {
+        } if subexpression.kind == .IF && (cast(*Code_If) subexpression).if_flags & .IS_STATIC {
             // we want to try to skip static ifs if the result is known at compile time and simple
             code_if := cast(*Code_If) subexpression;
             #if DEBUG then print(precursor);
             #if DEBUG then print("\tStsatic if: %\n", code_if.*);
 
-            if code_if.condition && code_if.condition.kind == .IDENT {
-                condition_ident := cast(*Code_Ident) code_if.condition;
-
-                #if DEBUG then print(precursor);
-                #if DEBUG then print("\tStatic ident: %\n", condition_ident.*);
-                
-                if condition_ident.resolved_declaration && condition_ident.resolved_declaration.expression {
-                    expression := condition_ident.resolved_declaration.expression;
-                    if expression.kind == .LITERAL {
-                        literal := cast(*Code_Literal) expression;
-                        go_then := literal.value_type == .BOOLEAN;
-                        go_then = go_then && !!literal._u64;
-
-                        // these are the only cases where we will essentially skip processing the if subexpression
-                        if go_then {
-                            if !validate_unlocked(plugin, code_if.then_block, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, code_if.then_block.kind), maybe_tprint("%\t", precursor)) {
-                                return false;
-                            }
-                        } else {
-                            if !validate_unlocked(plugin, code_if.else_block, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, code_if.else_block.kind), maybe_tprint("%\t", precursor)) {
-                                return false;
-                            }
-                        }
-
-                        continue;
-                    }
+            if code_if.static_if_flags & .EVALUATED_AS_TRUE {
+                if !validate_unlocked(plugin, code_if.then_block, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, code_if.then_block.kind), maybe_tprint("%\t", precursor)) {
+                    return false;
                 }
-            } else if code_if.condition {
-                #if DEBUG then print(precursor);
-                #if DEBUG then print("\tUnhandled static condition: %\n", code_if.condition.*);
+            } else {
+                if !validate_unlocked(plugin, code_if.else_block, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, code_if.else_block.kind), maybe_tprint("%\t", precursor)) {
+                    return false;
+                }
             }
+
+            // if code_if.condition && code_if.condition.kind == .IDENT {
+            //     condition_ident := cast(*Code_Ident) code_if.condition;
+
+            //     #if DEBUG then print(precursor);
+            //     #if DEBUG then print("\tStatic ident: %\n", condition_ident.*);
+
+            //     if condition_ident.resolved_declaration && condition_ident.resolved_declaration.expression {
+            //         expression := condition_ident.resolved_declaration.expression;
+            //         if expression.kind == .LITERAL {
+            //             literal := cast(*Code_Literal) expression;
+            //             go_then := literal.value_type == .BOOLEAN;
+            //             go_then = go_then && !!literal._u64;
+
+            //             // these are the only cases where we will essentially skip processing the if subexpression
+            //             if go_then {
+            //                 if !validate_unlocked(plugin, code_if.then_block, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, code_if.then_block.kind), maybe_tprint("%\t", precursor)) {
+            //                     return false;
+            //                 }
+            //             } else {
+            //                 if !validate_unlocked(plugin, code_if.else_block, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, code_if.else_block.kind), maybe_tprint("%\t", precursor)) {
+            //                     return false;
+            //                 }
+            //             }
+
+            //             continue;
+            //         }
+            //     }
+            // } else if code_if.condition {
+            //     #if DEBUG then print(precursor);
+            //     #if DEBUG then print("\tUnhandled static condition: %\n", code_if.condition.*);
+            // }
 
             // if we can't evaluate the static if statement we just continue
-            if !validate_unlocked(plugin, subexpression, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, subexpression.kind), maybe_tprint("%\t", precursor)) {
-                return false;
-            }
+            // if !validate_unlocked(plugin, subexpression, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, subexpression.kind), maybe_tprint("%\t", precursor)) {
+            //     return false;
+            // }
         } else {
             if !validate_unlocked(plugin, subexpression, visited, mutex_options, locked_mutexes, maybe_tprint("%.%", identifier, subexpression.kind), maybe_tprint("%\t", precursor)) {
                 return false;
@@ -434,6 +431,65 @@ validate_unlocked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, visited: *T
     }
 
     return true;
+}
+
+validate_mutex :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, mutex_options: *Table(*Code_Node, [..] *Code_Node), locked_mutexes: *[..] *Code_Node, location: Code_Node.Location, precursor: string = "") -> bool {
+
+    print_caller_trace :: () #expand {
+        node := context.stack_trace;
+        if node && node.info then print("% at %:%\n", node.info.name, node.info.location.fully_pathed_filename, node.line_number);
+    }
+
+    if locked_mutexes.count == 0 {
+        print_caller_trace();
+        compiler_report(plugin, "Calling a non-thread safe function from a thread safe function in a thread safety checked module. Without a locked mutex.", location, .ERROR_CONTINUABLE);
+        return true;
+    }
+
+    options := find_or_add(mutex_options, node);
+    if options.count == 0 {
+        // if there aren't yet any required mutexes, then add all of our locked mutexes
+        array_add(options, ..(locked_mutexes.*));
+    } else {
+        i := 0;
+        while i < options.count {
+            // if the optional mutex isn't currently locked, we remove it from the requirement list as it's no longer a valid lock holder
+            if !array_find(locked_mutexes.*, options.*[i]) {
+                array_ordered_remove_by_index(options, i);
+            } else {
+                i += 1;
+            }
+        }
+
+        // if there are no more optional mutexes left after locked mutex intersection, then it's no longer a valid call
+        if options.count == 0 {
+            compiler_report(plugin, "Calling a non-thread safe function and all mutexes that were expected to be locked, as indicated by other calls to this same function, weren't.", location, .ERROR_CONTINUABLE);
+            return true;
+        }
+    }
+
+    #if DEBUG then print(precursor);
+    #if DEBUG then print("\tHeader % was safe due to mutex locks: %\n", node.kind, locked_mutexes.*);
+
+    return false;
+}
+
+is_external_module_WORKAROUND :: (header_name: string) -> bool {
+    allowed :: string.[
+        "print",
+        "to_string",
+        "create_fixed_string",
+        "array_add",
+        "table_remove",
+        "find_or_add",
+        "append",
+        "builder_string_length",
+        "tprint",
+        "free",
+        "table_set",
+        "table_reset",
+    ];
+    return array_find(allowed, header_name);
 }
 
 is_relevant_module :: (plugin: *ThreadSafetyPlugin, location: Code_Node.Location) -> bool {
@@ -579,6 +635,104 @@ get_declaration_ident :: (plugin: *ThreadSafetyPlugin, binary: *Code_Binary_Oper
     }
 
     return null;
+}
+
+// the goal of this isn't to recurse indefinitely, but to check, for the current node, anything that it immediately touches, if it's tracked
+// we return when we find the actual @tracked value, so the ident / declaration before it is what is tracked
+get_tracked :: (plugin: *ThreadSafetyPlugin, node: *Code_Node, tracked: *[..] *Code_Node, should_print: bool) -> bool {
+    if !node || !is_relevant_module(plugin, node.location) {
+        return false;
+    }
+
+    note_kinds := Code_Node.Kind.[
+        .COMPOUND_DECLARATION,
+        .DECLARATION,
+        .ENUM,
+        .STRUCT,
+        .PROCEDURE_HEADER,
+    ];
+
+    notes: [] *Code_Note;
+    if node.kind == {
+        case .COMPOUND_DECLARATION;
+            notes = (cast(*Code_Compound_Declaration) node).notes;
+        case .DECLARATION;
+            notes = (cast(*Code_Declaration) node).notes;
+        case .ENUM;
+            notes = (cast(*Code_Enum) node).notes;
+        case .STRUCT;
+            notes = (cast(*Code_Struct) node).notes;
+        case .PROCEDURE_HEADER;
+            notes = (cast(*Code_Procedure_Header) node).notes;
+    }
+
+    for note: notes {
+        if note.text == "tracked" {
+            if should_print then print("FOUND %\n\n\n", node.kind);
+            return true;
+        }
+    }
+
+    // TODO not very confident I'm accounting for everything...
+    if node.kind == {
+        case .PROCEDURE_CALL;
+            procedure := cast(*Code_Procedure_Call) node;
+            if should_print then print("% %\n", (cast(*Code_Ident) procedure.procedure_expression).name, (cast(*Code_Procedure_Header) procedure.resolved_procedure_expression).name);
+            for arg: procedure.arguments_sorted {
+                if should_print then print("PROCEDURE_CALL\n");
+                if get_tracked(plugin, arg, tracked, should_print) {
+                    array_add(tracked, node);
+                }
+            }
+        case .IDENT;
+            ident := cast(*Code_Ident) node;
+            if should_print then print("IDENT %\n", ident.name);
+            if get_tracked(plugin, ident.resolved_declaration, tracked, should_print) {
+                array_add(tracked, node);
+            }
+        case .UNARY_OPERATOR;
+            unary := cast(*Code_Unary_Operator) node;
+            if should_print then print("UNARY_OPERATOR\n");
+            if get_tracked(plugin, unary.subexpression, tracked, should_print) {
+                array_add(tracked, node);
+            }
+        case .BINARY_OPERATOR;
+            binary := cast(*Code_Binary_Operator) node;
+            if should_print then print("BINARY_OPERATOR 1\n");
+            if get_tracked(plugin, binary.left, tracked, should_print) {
+                array_add(tracked, node);
+            }
+            if should_print then print("BINARY_OPERATOR 2\n");
+            if get_tracked(plugin, binary.right, tracked, should_print) {
+                array_add(tracked, node);
+            }
+        // case .DECLARATION;
+        //     declaration := cast(*Code_Declaration) node;
+        //     if should_print then print("DECLARATION\n");
+        //     if get_tracked(plugin, declaration.expression, tracked, should_print) {
+        //         array_add(tracked, node);
+        //     }
+        case .COMPOUND_DECLARATION;
+            compound := cast(*Code_Compound_Declaration) node;
+            if should_print then print("COMPOUND_DECLARATION\n");
+            if get_tracked(plugin, compound.comma_separated_assignment, tracked, should_print) {
+                array_add(tracked, node);
+            }
+            if should_print then print("COMPOUND_DECLARATION\n");
+            if get_tracked(plugin, compound.declaration_properties, tracked, should_print) {
+                array_add(tracked, node);
+            }
+        case .COMMA_SEPARATED_ARGUMENTS;
+            separated := cast(*Code_Comma_Separated_Arguments) node;
+            for arg: separated.arguments {
+                if should_print then print("COMMA_SEPARATED_ARGUMENTS\n");
+                if get_tracked(plugin, arg.node, tracked, should_print) {
+                    array_add(tracked, node);
+                }
+            }
+    }
+
+    return false;
 }
 
 maybe_tprint :: (format_string: string, args: ..Any) -> string {
